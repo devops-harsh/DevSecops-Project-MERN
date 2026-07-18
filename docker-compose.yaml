@@ -1,0 +1,68 @@
+services: # various services we can add
+  db: # first docker image
+   image: postgres:16-alpine # we are using the prebuilded image
+   container_name: jerney-db # name of the container
+   restart: unless-stopped  # restart if its is stopped unexpectedly dont stop if it is manually
+   environment: # this is env variable
+    POSTGRES_USER: jerney_user
+    POSTGRES_PASSWORD: jerney_pass_2026
+    POSTGRES_DB: jerney_db
+   ports:
+    - "5434:5432" # mapping the ports Host_Port: Container_port  
+                  # host_port - the port user access from outside world. container_port - the port our application listen in the inside container
+   volumes:
+    - pgdata:/var/lib/postgresql/data # it will used to mount the volume on the give path 
+   healthcheck: # used to health checkup that checkup is postgress is ready to establish the connection 
+      test: ["CMD-SHELL", "pg_isready -U jerney_user -d jerney_db"]
+      interval: 10s # docker run health checkup after every 10 second
+      timeout: 5s # if it goes more that 5 second then it will failed 
+      retries: 5 # it will marks as unhelthy after 5 consecutive faliure health checks
+      start_period: 10s
+  
+  # used for security it will have write permission as RAM for temporary
+   tmpfs:
+     - /tmp
+     - /run
+  
+  backend: # second docker servuce
+    build:
+      context: ./backend # path for the docker file
+      dockerfile: Dockerfile # name of the docker file
+    container_name: jerney-backend # name of the container after run
+    restart: unless-stopped # restart if its is stopped unexpectedly dont stop if it is manually
+    environment: # all env to run
+      PORT: "5000"
+      DB_USER: jerney_user
+      DB_PASSWORD: jerney_pass_2026
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: jerney_db
+    expose:
+      - "5000" # expose the port number 5000 for the orher containers
+    depends_on:
+      db:
+        condition: service_healthy # do not start this service until db service is healthy
+
+    security_opt: # prevent the application from gaining the additional linux privileges to reduce the risk and impove the security
+      - no-new-privileges:true
+    read_only: true # read only access of all the files
+    tmpfs: # temporary file access for write only for /tmp file
+      - /tmp    
+  
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: jerney-frontend
+    restart: unless-stopped
+    ports:
+      - "82:80" # our application runs on the 8080 and external world can use this application on the port 80
+    depends_on:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+
+volumes: # create new volume as named as pgdata 
+  pgdata:
+    driver: local
+
