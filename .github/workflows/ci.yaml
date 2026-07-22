@@ -207,8 +207,8 @@ jobs:
        id: sha
        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
      
-      - name: Update Kubernetes Manifest
-        run: |
+     - name: Update Kubernetes Manifest
+       run: |
          image_tag=${{ steps.sha.outputs.short }}
 
           # Find backend image line
