@@ -119,7 +119,7 @@ jobs:
   image-scan: # this is fourth job. we use trivy for the docker image scan
     name: image scan using trivy
     runs-on: ubuntu-latest
-    needs: docker-push
+    needs: lint
     continue-on-error: true
     strategy:
       matrix:
