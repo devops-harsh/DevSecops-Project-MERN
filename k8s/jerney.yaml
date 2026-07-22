@@ -187,7 +187,7 @@ spec:
               echo "DB is ready!"
       containers:
       - name: backend
-        image: harsh2409/jerney-backend:latest
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-backend:dd7bf17
         ports:
             - containerPort: 5000 # the application is in the container listens on port 5000
               protocol: TCP
@@ -288,7 +288,7 @@ spec:
           effect: "NoSchedule"
       containers:
       - name: jerney-frontend
-        image: harsh2409/jerney-frontend:latest
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:dd7bf17
         ports:
         - containerPort: 80
         resources: # maximum and minimum resources the postgres container can user
