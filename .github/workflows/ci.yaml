@@ -207,25 +207,39 @@ jobs:
        id: sha
        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
      
-     - name: update k8s manifest
-       run: |
-        image_tag=${{ steps.sha.outputs.short }}
-        
-          # Find the line number of the backend container image
-          # (the image: line right after `- name: backend`)
-          BACKEND_LINE=$(awk '/- name: backend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
-          echo "Backend image at line: ${BACKEND_LINE}"
-          sed -i "${BACKEND_LINE}s|.*|          image: ${BACKEND_IMAGE}:${image_tag}|" k8s/jerney.yaml
+      - name: Update Kubernetes Manifest
+        run: |
+         image_tag=${{ steps.sha.outputs.short }}
 
-         # Find the line number of the frontend container image
-          # (the image: line right after `- name: frontend`)
-          FRONTEND_LINE=$(awk '/- name: frontend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
-          echo "Frontend image at line: ${FRONTEND_LINE}"
-          sed -i "${FRONTEND_LINE}s|.*|          image: ${FRONTEND_IMAGE}:${image_tag}|" k8s/jerney.yaml
-         
-         echo "updated the image tag succesfully"
-         grep -n "image:" k8s/jerney.yaml
-     
+          # Find backend image line
+          BACKEND_LINE=$(awk '/- name: jerney-backend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
+
+          if [ -z "$BACKEND_LINE" ]; then
+          echo "❌ Backend container not found!"
+          exit 1
+          fi
+
+          echo "Backend image line: $BACKEND_LINE"
+
+          sed -i "${BACKEND_LINE}s|.*|        image: ${BACKEND_IMAGE}:${image_tag}|" k8s/jerney.yaml
+
+          # Find frontend image line
+          FRONTEND_LINE=$(awk '/- name: jerney-frontend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
+
+          if [ -z "$FRONTEND_LINE" ]; then
+          echo "❌ Frontend container not found!"
+          exit 1
+          fi
+
+          echo "Frontend image line: $FRONTEND_LINE"
+
+          sed -i "${FRONTEND_LINE}s|.*|        image: ${FRONTEND_IMAGE}:${image_tag}|" k8s/jerney.yaml
+
+          echo "✅ Updated image tags successfully"
+
+          echo "----- Updated image lines -----"
+          grep -n "image:" k8s/jerney.yaml
+
      - name: commit and push manifest update 
        run: |
           git config user.name "github-actions[bot]"
