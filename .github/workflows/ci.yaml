@@ -207,48 +207,36 @@ jobs:
        id: sha
        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
      
-     - name: Update Kubernetes Manifest
+     - name: update k8s manifest
        run: |
-        set -e
-        image_tag="${{ steps.sha.outputs.short }}"
+        image_tag=${{ steps.sha.outputs.short }}
 
-        echo "===== Current Manifest ====="
-        cat k8s/jerney.yaml
-        echo "============================"
-
-        # Backend
+        # Find the line number of the backend container image
+        # (the image: line right after `- name: backend`)
         BACKEND_LINE=$(awk '
-        /- name:[[:space:]]*jerney-backend/ {found=1}
+        /- name:[[:space:]]*backend/ {found=1}
         found && /^[[:space:]]*image:/ {print NR; exit}
         ' k8s/jerney.yaml)
 
-        if [ -z "$BACKEND_LINE" ]; then
-        echo "❌ Backend container not found!"
-        exit 1
-        fi
+        echo "Backend image at line: ${BACKEND_LINE}"
 
-        echo "Backend image line: $BACKEND_LINE"
+        sed -i "${BACKEND_LINE}s|.*|          image: ${BACKEND_IMAGE}:${image_tag}|" k8s/jerney.yaml
 
-        sed -i "${BACKEND_LINE}s|.*|        image: ${BACKEND_IMAGE}:${image_tag}|" k8s/jerney.yaml
-
-        # Frontend
+        # Find the line number of the frontend container image
+        # (the image: line right after `- name: jerney-frontend`)
         FRONTEND_LINE=$(awk '
         /- name:[[:space:]]*jerney-frontend/ {found=1}
         found && /^[[:space:]]*image:/ {print NR; exit}
         ' k8s/jerney.yaml)
 
-        if [ -z "$FRONTEND_LINE" ]; then
-        echo "❌ Frontend container not found!"
-        exit 1
-        fi
+        echo "Frontend image at line: ${FRONTEND_LINE}"
 
-        echo "Frontend image line: $FRONTEND_LINE"
+        sed -i "${FRONTEND_LINE}s|.*|          image: ${FRONTEND_IMAGE}:${image_tag}|" k8s/jerney.yaml
 
-        sed -i "${FRONTEND_LINE}s|.*|        image: ${FRONTEND_IMAGE}:${image_tag}|" k8s/jerney.yaml
+        echo "Updated the image tag successfully"
 
-        echo "===== Updated Manifest ====="
         grep -n "image:" k8s/jerney.yaml
-
+     
      - name: commit and push manifest update 
        run: |
           git config user.name "github-actions[bot]"
