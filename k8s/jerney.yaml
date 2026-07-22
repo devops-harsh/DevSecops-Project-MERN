@@ -1,391 +1,391 @@
-# 1) creating the namespace 
-
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: jerney
-  labels:
-    name: jerney
-
----
-
-# 2) creating the secret for the Database 
-
-apiVersion: v1
-kind: Secret
-metadata:
-  name: jerney-db-secret
-  namespace: jerney
-type: Opaque # default secret type its stores in key - value pairs  
-data: # converted all values using base 64
-   POSTGRES_USER: amVybmV5X3VzZXI=
-   POSTGRES_PASSWORD: amVybmV5X3Bhc3NfMjAyNg==
-   POSTGRES_DB: amVybmV5X2Ri
-
----
-
-# 3) creating the storage class 
-# pvc(persistent volume claim) communicate and request the storage from storage class and storage class is responsible for creating persistent volume within my given infrastrcture
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: jerney-ebs-sc
-provisioner: ebs.csi.eks.amazonaws.com
-reclaimPolicy: Retain # data needs to be remain unitl manually delete the PV even if pvc get deleted PV should be there with all the data
-allowVolumeExpansion: true # we can expand it later
-volumeBindingMode: WaitForFirstConsumer # it specifies when to create and bind  PV. here when pod is uses the PVC then only it will create the Pv
-parameters:
-  type: gp3
-  encrypted: "true"
-
----
-
-# 4) creating the PVC persistent volume claim 
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: jerney-db-pvc
-  namespace: jerney
-spec:
-  storageClassName: jerney-ebs-sc
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi # 10 gb of ebs volume 
-
----
-
-# 5) deployment for postgreSQL
-
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: db-deployment
-  namespace: jerney
-  labels:
-    app.kubernetes.io/name: jerney-db
-    app.kubernetes.io/part-of: jerney
-    app.kubernetes.io/component: database
-spec:
-  replicas: 1
-  strategy: # how to update pods when new version of application deployed
-    type: Recreate # delete previous all the pods and create new 
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: jerney-db
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: jerney-db
-        app.kubernetes.io/part-of: jerney
-        app.kubernetes.io/component: database
-    spec:
-      automountServiceAccountToken: false # dont attach the automatic service account token as DB dont need to communicate with the K8s API
-      tolerations:
-        - key: "karpenter.sh/disrupted" # karpenter mechanism for the EKS Auto mode
-          operator: "Exists"
-          effect: "NoSchedule"
-      containers:
-        - name: postgres
-          image: postgres:16-alpine
-          ports:
-            - containerPort: 5432
-              protocol: TCP
-          envFrom: # secret attaching 
-            - secretRef:
-                name: jerney-db-secret
-          volumeMounts: # volume mount for we creating the EBS volume
-            - name: db-storage
-              mountPath: /var/lib/postgresql/data
-              subPath: pgdata
-          resources: # maximum and minimum resources the postgres container can user
-            requests:
-              cpu: 250m
-              memory: 256Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
-          # Security context
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: false # Postgres needs write access
-            runAsNonRoot: false            # Postgres image runs initdb as root then drops
-          livenessProbe:
-            exec:
-              command: ["pg_isready", "-U", "jerney_user", "-d", "jerney_db"]
-            initialDelaySeconds: 15
-            periodSeconds: 10
-            timeoutSeconds: 5
-          readinessProbe:
-            exec:
-              command: ["pg_isready", "-U", "jerney_user", "-d", "jerney_db"]
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 3
-      volumes:
-        - name: db-storage
-          persistentVolumeClaim: # 
-            claimName: jerney-db-pvc
-
----
-
-# 6) Service for postgreSQL
-apiVersion: v1
-kind: Service
-metadata:
-  name: jerney-db-service
-  labels:
-    app.kubernetes.io/name: jerney-db-service
-  namespace: jerney
-spec:
-  selector:
-    app.kubernetes.io/name: jerney-db
-  ports:
-    - protocol: TCP
-      port: 5432 # other pods can connect to this port and k8s resources
-      targetPort: 5432 # Application inside the pod listen on this port
-  type: ClusterIP
-
----
-
-# 7) Deployment for the backend 
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: backend-deployment
-  labels:
-    app.kubernetes.io/name: jerney-backend
-  namespace: jerney
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: jerney-backend
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: jerney-backend
-    spec:
-      automountServiceAccountToken: false # it will not mount the service account and token for this pods 
-      tolerations: # if the EKS node has taint( restriction as karpenter.sh/disrupted ) then still this pod has permission to run. 
-        - key: "karpenter.sh/disrupted"
-          operator: "Exists"
-          effect: "NoSchedule"
-      initContainers: # init container wait until it matches condition. here we used to check is init container is waiting for the db pod to start 
-        - name: wait-for-db
-          image: busybox:1.36
-          command:
-            - sh
-            - -c
-            - |
-              echo "Waiting for jerney-db:5432..."
-              until nc -z jerney-db-service 5432; do
-                echo "DB not ready, retrying in 3s..."
-                sleep 3
-              done
-              echo "DB is ready!"
-      containers:
-      - name: backend
-        image: harsh2409/jerney-backend:latest
-        ports:
-            - containerPort: 5000 # the application is in the container listens on port 5000
-              protocol: TCP
-        env:
-            - name: PORT
-              value: "5000"
-            - name: DB_HOST
-              value: "jerney-db-service"
-            - name: DB_PORT
-              value: "5432"
-            - name: DB_USER
-              valueFrom:
-                secretKeyRef:
-                  name: jerney-db-secret
-                  key: POSTGRES_USER
-            - name: DB_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: jerney-db-secret
-                  key: POSTGRES_PASSWORD
-            - name: DB_NAME
-              valueFrom:
-                secretKeyRef:
-                  name: jerney-db-secret
-                  key: POSTGRES_DB    
-        resources: # maximum and minimum resources the postgres container can user
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 300m
-              memory: 256Mi
-        securityContext:
-            allowPrivilegeEscalation: false # prevent pod from gaining the higher access
-            readOnlyRootFilesystem: true # makes pods root file as read only 
-            runAsNonRoot: true # ensure pod run as non-root user
-            runAsUser: 1000 # run the pod as linux user id 1000
-            capabilities: # remove all the capabltities of linux
-              drop:
-                - ALL # all capablities remove 
-        livenessProbe: # check wether the application is running or not. if probe fails k8s thinks it is crash or stucked and we restart the pod
-            httpGet:
-              path: /api/health # send request on the routes
-              port: 5000
-            initialDelaySeconds: 10 # wait for 10 second before first health checkup to start the pod.
-            periodSeconds: 15 # check the pod health every 15 second
-            timeoutSeconds: 5  # wait for 5 second for health response
-        readinessProbe: # its checks pod is ready to recive the traffic or not. if it nor recive traffic it remove that pod until it becomes ready agan to recieve the request.
-            httpGet:
-              path: /api/health
-              port: 5000
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 3 
-
----
-# 8) Service for the backend
-apiVersion: v1
-kind: Service
-metadata:
-  name: jerney-backend
-  namespace: jerney
-  labels:
-   app.kubernetes.io/name: jerney-backend
-spec:
-  selector:
-    app.kubernetes.io/name: jerney-backend
-  ports:
-  - name: backend-port
-    protocol: TCP
-    port: 5000
-    targetPort: 5000
-  type: ClusterIP
-
----  
-# 9) Deployment for frontend
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: frontend-deployment
-  labels:
-   app.kubernetes.io/name: jerney-frontend
-  namespace: jerney
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: jerney-frontend
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: jerney-frontend
-    spec:
-      automountServiceAccountToken: false # it will not mount the service account and token for this pods 
-      tolerations: # if the EKS node has taint( restriction as karpenter.sh/disrupted ) then still this pod has permission to run. 
-        - key: "karpenter.sh/disrupted"
-          operator: "Exists"
-          effect: "NoSchedule"
-      containers:
-      - name: jerney-frontend
-        image: harsh2409/jerney-frontend:latest
-        ports:
-        - containerPort: 80
-        resources: # maximum and minimum resources the postgres container can user
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 300m
-              memory: 256Mi
-        securityContext:
-            allowPrivilegeEscalation: false # prevent pod from gaining the higher access
-            readOnlyRootFilesystem: false  
-            runAsNonRoot: true # ensure pod run as non-root user
-            runAsUser: 101 # run the pod as linux user id 101
-            capabilities: # remove all the capabltities of linux
-              drop:
-                - ALL # all capablities remove 
-        livenessProbe: # check wether the application is running or not. if probe fails k8s thinks it is crash or stucked and we restart the pod
-            httpGet:
-              path: / # send request on the routes
-              port: 80
-            initialDelaySeconds: 10 # wait for 10 second before first health checkup to start the pod.
-            periodSeconds: 15 # check the pod health every 15 second
-            timeoutSeconds: 5  # wait for 5 second for health response
-        readinessProbe: # its checks pod is ready to recive the traffic or not. if it nor recive traffic it remove that pod until it becomes ready agan to recieve the request.
-            httpGet:
-              path: /
-              port: 80
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 3 
----
-# 10) Service for the frontend 
-apiVersion: v1
-kind: Service
-metadata:
-  name: frontend-service
-  namespace: jerney
-  labels:
-   app.kubernetes.io/name: jerney-frontend
-spec:
-  selector:
-    app.kubernetes.io/name: jerney-frontend
-  ports:
-  - name: frontend-port
-    protocol: TCP
-    port: 8080
-    targetPort: 80
-  type: NodePort
-
----
-# 11) Network policy for the DB
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: db-network-policy
-  namespace: jerney
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: jerney-db
-  policyTypes:
-  - Ingress # policy control the incomming traffic 
-  ingress: # defining the rule for the incoming traffic
-   - from:
-     - podSelector:
-        matchLabels:
-         app.kubernetes.io/name: jerney-backend
-     ports: # allow only traffic on port
-      - port: 5432
-        protocol: TCP
----
-# network policy for the backend 
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: backend-network-policy
-  namespace: jerney
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: jerney-backend
-  policyTypes:
-  - Ingress
-  ingress:
-  - from:
-    - podSelector:
-       matchLabels:
-         app.kubernetes.io/name: jerney-frontend
-    ports:
-    - protocol: TCP
-      port: 5000
-
-
-
-
-
-
-
-
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
+          image: ghcr.io/devops-harsh/DevSecops-Project-MERN/jerney-frontend:ddb639d
