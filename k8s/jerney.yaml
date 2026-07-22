@@ -7,6 +7,8 @@ metadata:
   labels:
     name: jerney
 
+---
+
 # 2) creating the secret for the Database 
 
 apiVersion: v1
@@ -19,6 +21,8 @@ data: # converted all values using base 64
    POSTGRES_USER: amVybmV5X3VzZXI=
    POSTGRES_PASSWORD: amVybmV5X3Bhc3NfMjAyNg==
    POSTGRES_DB: amVybmV5X2Ri
+
+---
 
 # 3) creating the storage class 
 # pvc(persistent volume claim) communicate and request the storage from storage class and storage class is responsible for creating persistent volume within my given infrastrcture
@@ -34,6 +38,7 @@ parameters:
   type: gp3
   encrypted: "true"
 
+---
 
 # 4) creating the PVC persistent volume claim 
 apiVersion: v1
@@ -49,6 +54,7 @@ spec:
     requests:
       storage: 10Gi # 10 gb of ebs volume 
 
+---
 
 # 5) deployment for postgreSQL
 
@@ -122,6 +128,8 @@ spec:
           persistentVolumeClaim: # 
             claimName: jerney-db-pvc
 
+---
+
 # 6) Service for postgreSQL
 apiVersion: v1
 kind: Service
@@ -138,6 +146,8 @@ spec:
       port: 5432 # other pods can connect to this port and k8s resources
       targetPort: 5432 # Application inside the pod listen on this port
   type: ClusterIP
+
+---
 
 # 7) Deployment for the backend 
 apiVersion: apps/v1
@@ -233,11 +243,12 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3 
 
+---
 # 8) Service for the backend
 apiVersion: v1
 kind: Service
 metadata:
-  name: backend-service
+  name: jerney-backend
   namespace: jerney
   labels:
    app.kubernetes.io/name: jerney-backend
@@ -251,6 +262,7 @@ spec:
     targetPort: 5000
   type: ClusterIP
 
+---  
 # 9) Deployment for frontend
 apiVersion: apps/v1
 kind: Deployment
@@ -288,9 +300,9 @@ spec:
               memory: 256Mi
         securityContext:
             allowPrivilegeEscalation: false # prevent pod from gaining the higher access
-            readOnlyRootFilesystem: true # makes pods root file as read only 
+            readOnlyRootFilesystem: false  
             runAsNonRoot: true # ensure pod run as non-root user
-            runAsUser: 1000 # run the pod as linux user id 1000
+            runAsUser: 101 # run the pod as linux user id 101
             capabilities: # remove all the capabltities of linux
               drop:
                 - ALL # all capablities remove 
@@ -308,7 +320,7 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 3 
-
+---
 # 10) Service for the frontend 
 apiVersion: v1
 kind: Service
@@ -327,7 +339,7 @@ spec:
     targetPort: 80
   type: NodePort
 
-
+---
 # 11) Network policy for the DB
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -341,14 +353,14 @@ spec:
   policyTypes:
   - Ingress # policy control the incomming traffic 
   ingress: # defining the rule for the incoming traffic
-    - from:
-    - podSelector:
+   - from:
+     - podSelector:
         matchLabels:
-          app.kubernetes.io/name: jerney-backend
-      ports: # allow only traffic on port
+         app.kubernetes.io/name: jerney-backend
+     ports: # allow only traffic on port
       - port: 5432
         protocol: TCP
-
+---
 # network policy for the backend 
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -364,8 +376,8 @@ spec:
   ingress:
   - from:
     - podSelector:
-        matchLabels:
-           app.kubernetes.io/name: jerney-frontend
+       matchLabels:
+         app.kubernetes.io/name: jerney-frontend
     ports:
     - protocol: TCP
       port: 5000
